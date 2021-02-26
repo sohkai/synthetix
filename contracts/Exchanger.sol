@@ -81,12 +81,20 @@ contract Exchanger is Owned, MixinSystemSettings, IExchanger {
         uint timestamp;
     }
 
+    struct ExchangeVolumeAtPeriod {
+        uint64 startTime;
+        uint192 volume;
+    }
+
     bytes32 private constant sUSD = "sUSD";
 
     // SIP-65: Decentralized circuit breaker
     uint public constant CIRCUIT_BREAKER_SUSPENSION_REASON = 65;
 
+    // SIP-115: should this be updated with the executed or chainlink price?
     mapping(bytes32 => uint) public lastExchangeRate;
+
+    ExchangeVolumeAtPeriod public lastAtomicVolume;
 
     /* ========== ADDRESS RESOLVER CONFIGURATION ========== */
 
@@ -183,6 +191,7 @@ contract Exchanger is Owned, MixinSystemSettings, IExchanger {
         (reclaimAmount, rebateAmount, numEntries, ) = _settlementOwing(account, currencyKey);
     }
 
+    // TODO: this comment below about emitting events isn't true, is it?
     // Internal function to emit events for each individual rebate and reclaim entry
     function _settlementOwing(address account, bytes32 currencyKey)
         internal
@@ -218,7 +227,7 @@ contract Exchanger is Owned, MixinSystemSettings, IExchanger {
             );
 
             // and deduct the fee from this amount using the exchangeFeeRate from storage
-            uint amountShouldHaveReceived = _getAmountReceivedForExchange(destinationAmount, exchangeEntry.exchangeFeeRate);
+            uint amountShouldHaveReceived = _deductFeesFromAmount(destinationAmount, exchangeEntry.exchangeFeeRate);
 
             // SIP-65 settlements where the amount at end of waiting period is beyond the threshold, then
             // settle with no reclaim or rebate
@@ -359,6 +368,7 @@ contract Exchanger is Owned, MixinSystemSettings, IExchanger {
         _processTradingRewards(fee, exchangeForAddress);
     }
 
+    // SIP-115: Should tracking be included?
     function exchangeWithTracking(
         address from,
         bytes32 sourceCurrencyKey,
@@ -378,6 +388,7 @@ contract Exchanger is Owned, MixinSystemSettings, IExchanger {
             false
         );
 
+        // TODO: why is there originator vs. destinationAddress?
         _processTradingRewards(fee, originator);
 
         _emitTrackingEvent(trackingCode, destinationCurrencyKey, amountReceived);
@@ -434,6 +445,27 @@ contract Exchanger is Owned, MixinSystemSettings, IExchanger {
         }
     }
 
+    function exchangeAtomically(
+        address from,
+        bytes32 sourceCurrencyKey,
+        uint sourceAmount,
+        bytes32 destinationCurrencyKey,
+        // TODO: this destinationAddress variable doesn't seem to be needed since it's always the same as from
+        address destinationAddress
+        // TODO: include tracking?
+    ) external onlySynthetixorSynth returns (uint amountReceived) {
+        uint fee;
+        (amountReceived, fee) = _exchangeAtomically(
+            from,
+            sourceCurrencyKey,
+            sourceAmount,
+            destinationCurrencyKey,
+            destinationAddress
+        );
+
+        _processTradingRewards(fee, destinationAddress);
+    }
+
     function _emitTrackingEvent(
         bytes32 trackingCode,
         bytes32 toCurrencyKey,
@@ -448,6 +480,9 @@ contract Exchanger is Owned, MixinSystemSettings, IExchanger {
         }
     }
 
+    // SIP-115: maybe atomic exchanges shouldn't check the circuit breaker?
+    //          DEX spot can be easily manipulated to suspend a synth, so we would still want to use
+    //          the chainlink rate here
     function _suspendIfRateInvalid(bytes32 currencyKey, uint rate) internal returns (bool circuitBroken) {
         if (_isSynthRateInvalid(currencyKey, rate)) {
             systemStatus().suspendSynth(currencyKey, CIRCUIT_BREAKER_SUSPENSION_REASON);
@@ -489,6 +524,7 @@ contract Exchanger is Owned, MixinSystemSettings, IExchanger {
         sourceAmountAfterSettlement = sourceAmount;
 
         // when settlement was required
+        // TODO: are refunds immediately added to the current exchange?
         if (numEntriesSettled > 0) {
             // ensure the sourceAmount takes this into account
             sourceAmountAfterSettlement = calculateAmountAfterSettlement(from, sourceCurrencyKey, sourceAmount, refunded);
@@ -596,6 +632,36 @@ contract Exchanger is Owned, MixinSystemSettings, IExchanger {
             amountReceived,
             exchangeFeeRate
         );
+    }
+
+    function _exchangeAtomically(
+        address from,
+        bytes32 sourceCurrencyKey,
+        uint sourceAmount,
+        bytes32 destinationCurrencyKey,
+        address destinationAddress,
+    )
+        internal
+        returns (
+            uint amountReceived,
+            uint fee
+        )
+    {
+        // TODO:
+        //   1. ensure can exchange (also checks if any chainlink flags are up)
+        //     - check here if synths are allowed to be atomically exchanged or leave that up to ExchangeRates?
+        //   2. settle any previous exchanges
+        //   3. convert source synth into sUSD and update volume counter
+        //   4. get amounts and rates (_getAmountsForAtomicExchangeMinusFees())
+        //   5. check _isSynthRateInvalid()
+        //     - if we also have the chainlink price at this stage, we can check the circuit breaker with it
+        //   6. burn/issue via _convert()
+        //   7. remit sUSD fee via chainlink price
+        //
+        //   - avoid persisting exchange via appendExchange() to avoid fee reclamation state
+        //   - do we need to update the debt cache (_updateSNXIssuedDebtOnExchange())? If so, we
+        //     should use the chainlink rates?
+        //   - emitSynthExchange() is ok or should another event be used?
     }
 
     function _convert(
@@ -872,11 +938,58 @@ contract Exchanger is Owned, MixinSystemSettings, IExchanger {
             destinationCurrencyKey
         );
         exchangeFeeRate = _feeRateForExchange(sourceCurrencyKey, destinationCurrencyKey);
-        amountReceived = _getAmountReceivedForExchange(destinationAmount, exchangeFeeRate);
+        amountReceived = _deductFeesFromAmount(destinationAmount, exchangeFeeRate);
         fee = destinationAmount.sub(amountReceived);
     }
 
-    function _getAmountReceivedForExchange(uint destinationAmount, uint exchangeFeeRate)
+    function getAmountsForAtomicExchange(
+        uint sourceAmount,
+        bytes32 sourceCurrencyKey,
+        bytes32 destinationCurrencyKey
+    )
+        external
+        view
+        returns (
+            uint amountReceived,
+            uint fee,
+            uint exchangeFeeRate
+        )
+    {
+        (amountReceived, fee, exchangeFeeRate, , ) = _getAmountsForAtomicExchangeMinusFees(
+            sourceAmount,
+            sourceCurrencyKey,
+            destinationCurrencyKey
+        );
+    }
+
+    function _getAmountsForAtomicExchangeMinusFees(
+        uint sourceAmount,
+        bytes32 sourceCurrencyKey,
+        bytes32 destinationCurrencyKey
+    )
+        internal
+        view
+        returns (
+            uint amountReceived,
+            uint fee,
+            uint exchangeFeeRate,
+            uint sourceRate,
+            uint destinationRate
+        )
+    {
+        uint destinationAmount;
+        // TODO: differentiate chainlink vs execution rates
+        (destinationAmount, sourceRate, destinationRate) = exchangeRates().effectiveAtomicValueAndRates(
+            sourceCurrencyKey,
+            sourceAmount,
+            destinationCurrencyKey
+        );
+        exchangeFeeRate = _feeRateForExchange(sourceCurrencyKey, destinationCurrencyKey);
+        amountReceived = _deductFeesFromAmount(destinationAmount, exchangeFeeRate);
+        fee = destinationAmount.sub(amountReceived);
+    }
+
+    function _deductFeesFromAmount(uint destinationAmount, uint exchangeFeeRate)
         internal
         pure
         returns (uint amountReceived)
@@ -943,6 +1056,7 @@ contract Exchanger is Owned, MixinSystemSettings, IExchanger {
 
     // ========== MODIFIERS ==========
 
+    // TODO: seems a bit overkill to always include synths when only the exchange() function needs it
     modifier onlySynthetixorSynth() {
         ISynthetix _synthetix = synthetix();
         require(
